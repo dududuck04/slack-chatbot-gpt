@@ -1,0 +1,281 @@
+import Slack from "@slack/bolt"
+import { ChatGPTAPI } from 'chatgpt'
+import debounce from 'debounce-promise';
+
+let first_ts;
+let event_first_ts;
+let isUpdating = false;
+
+// 유료 버전
+const api = new ChatGPTAPI({
+    apiKey: process.env.OPENAI_API_KEY,
+    completionParams: {
+        frequency_penalty: 0,
+        presence_penalty: 0
+    }
+});
+
+const awsLambdaReceiver = new Slack.AwsLambdaReceiver({
+    signingSecret: process.env.SLACK_SIGNING_SECRET,
+});
+
+const app = new Slack.App({
+    token: process.env.SLACK_APP_TOKEN,
+    signingSecret: process.env.SLACK_SIGNING_SECRET,
+    receiver: awsLambdaReceiver,
+    processBeforeResponse: true,
+});
+
+
+const updateMessage = debounce(async ({ channel, ts, text, payload }) => {
+
+    let result = await app.client.chat.update({
+        channel: channel,
+        ts: ts,
+        text: text,
+        metadata: payload ? {
+            event_type: "chat_gpt",
+            event_payload: payload
+        } : undefined
+    });
+
+}, 1000);
+
+
+app.event('app_mention', async ({ event, say }) => {
+
+    const prompt = event.text.replace(/(?:\s)<@[^, ]*|(?:^)<@[^, ]*/, '');
+    let msg = "<@" + event.user + "> 님이 질문하였습니다: \n";
+    msg += ">" + prompt + "\n";
+
+    const options = {
+        channel: event.channel,
+        ts: event.ts,
+        latest: event.ts,
+        inclusive: true,
+        include_all_metadata: true,
+        limit: 20,
+    };
+
+    async function getFirstTs(event) {
+        event_first_ts = event.ts;
+        return event_first_ts;
+    }
+
+    if (!event.parent_user_id || undefined) {
+        event_first_ts = await getFirstTs(event)
+    } else {
+        options.ts = event_first_ts;
+    }
+
+    let { messages } = await app.client.conversations.replies(options);
+
+    messages.filter(message => message.thread_ts === event_first_ts)
+
+    console.log("MESSAGE: \n" + JSON.stringify(messages, null, 2));
+
+
+    const previus = (messages || [])[(messages.length -2)]?.metadata?.event_payload || {
+        parentMessageId: undefined,
+        conversationId: undefined
+    };
+
+    console.log("PREVIUS: \n" + JSON.stringify(previus, null, 2));
+
+
+    const ms = await say({
+        channel: event.channel,
+        text: ':thinking_face: 프로세스가 처리되는 동안 잠시 기다려주세요.',
+        thread_ts: event.ts
+    });
+
+    if (!isUpdating) {
+        isUpdating = true;
+
+        try {
+            const answer = await api.sendMessage(prompt,{
+                parentMessageId: previus.parentMessageId,
+                conversationId: previus.conversationId,});
+
+            msg += answer.text;
+
+            await updateMessage({
+                channel: ms.channel,
+                ts: ms.ts,
+                text: `${msg} 🔚`,
+                payload: answer
+            });
+
+        } catch (error) {
+            console.error(error);
+
+            if (error instanceof Error) {
+                await app.client.chat.update({
+                    channel: ms.channel,
+                    ts: ms.ts,
+                    text: `⚠️ ${error.toString()}`,
+                });
+            }
+        } finally {
+            isUpdating = false;
+        }
+    }
+
+});
+
+app.message('reset', async ({ message, say }) => {
+
+    await say({
+        channel: message.channel,
+        text: 'I reset your session',
+    });
+});
+
+app.message(async ({ message, say }) => {
+    const isUserMessage =
+        message.type === 'message' && !message.subtype && !message.bot_id;
+
+    // await restartSession(message)
+
+    const prompt = message.text.replace(/(?:\s)<@[^, ]*|(?:^)<@[^, ]*/, '')
+    let msg = "<@" + message.user + "> 님이 질문하였습니다:\n";
+    msg += ">" + message.text + "\n";
+
+    if (isUserMessage && message.text && message.text !== 'reset') {
+
+        // const { messages } = await app.client.conversations.history({
+        //     channel: message.channel,
+        //     latest: message.ts,
+        //     inclusive: true,
+        //     include_all_metadata: true,
+        //     limit: 20,
+        // });
+
+        const options = {
+            channel: message.channel,
+            ts: message.ts,
+            latest: message.ts,
+            inclusive: true,
+            include_all_metadata: true,
+            limit: 20,
+        };
+
+        async function getFirstTs(message) {
+            first_ts = message.ts;
+            return first_ts;
+        }
+
+        if (!message.parent_user_id || undefined) {
+            console.log('thread started')
+            first_ts = await getFirstTs(message)
+        }
+        else {
+            options.ts = first_ts
+        }
+
+        console.log(message.thread_ts)
+        console.log(first_ts)
+
+        const { messages } = await app.client.conversations.replies(options);
+
+        messages.filter(message => message.thread_ts === event_first_ts)
+
+        console.log("MESSAGE: \n" + JSON.stringify(message, null, 2));
+
+
+        const previus = (messages || [])[(messages.length -2)]?.metadata?.event_payload || {
+            parentMessageId: undefined,
+            conversationId: undefined
+        };
+
+        console.log(previus)
+
+        const ms = await say({
+            channel: message.channel,
+            text: ':thinking_face: 프로세스가 처리되는 동안 잠시 기다려주세요.',
+            thread_ts: message.ts
+        });
+
+        try {
+            const answer = await api.sendMessage(prompt,{
+                parentMessageId: previus.parentMessageId,
+                conversationId: previus.conversationId,});
+
+
+            msg += answer.text;
+
+
+            await updateMessage({
+                channel: ms.channel,
+                ts: ms.ts,
+                text: `${msg} 🔚`,
+                payload: answer
+            });
+
+        } catch (error) {
+            console.error(error);
+
+            if (error instanceof Error) {
+                await app.client.chat.update({
+                    channel: ms.channel,
+                    ts: ms.ts,
+                    text: `⚠️ ${error.toString()}`,
+                });
+            }
+        }
+    }
+});
+
+app.error((error) => {
+    console.error(error);
+    return Promise.resolve();
+});
+
+async function restartSession(obj){
+
+    let initialTimestamp = null;
+
+    if (!obj.parent_user_id || undefined) {
+        console.log("restart session");
+        initialTimestamp = await getFirstTs(obj, initialTimestamp)
+    } else {
+
+        let currentTimestamp = parseInt((Date.now() / 1000).toFixed(0))
+        console.log('current: ',currentTimestamp)
+
+        if ((initialTimestamp + 27) - currentTimestamp < 0){
+
+            console.log('session restart')
+
+            initialTimestamp = obj.ts
+            console.log('newInitialTimeStamp', initialTimestamp)
+
+            return app.message(async ({say}) => {
+                const timeoutMessage = await say({
+                    channel: obj.channel,
+                    text: '세션이 연장되었습니다.',
+                    thread_ts: obj.ts
+                })
+                console.log('timeout: ', timeoutMessage)
+            });
+        }
+    }
+}
+
+
+
+export const handler = async (event, context, callback) => {
+    try{
+        if(event.headers['X-Slack-Retry-Num']) {
+            return { statusCode: 200, body: "ok" }
+        }
+        const handler = await awsLambdaReceiver.start();
+
+        return handler(event, context, callback);
+
+    } catch (err){
+        console.log('err: ', err)
+        throw err;
+    }
+
+}
